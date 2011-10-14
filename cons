@@ -1,0 +1,271 @@
+#!/usr/bin/env ruby
+
+# settings
+DIR = "~/opt/cons/"
+RETRY_FILE = "/home/scott/.cons_retry"
+DOWNLOADER = "aria2c -c -d"
+YDL = "~/src/youtube-dl/youtube-dl"
+
+# globals
+CONSUME_VERSION = "0.1.0"
+
+# md5
+require 'digest/md5'
+def md5 s
+  Digest::MD5.hexdigest s
+end
+
+# option parsing
+require 'optparse'
+
+# make --help default
+if ARGV == []
+  ARGV << "--list"
+end
+
+# support short item form e.g. "cons 0"
+ARGV.unshift "--item" if Integer(ARGV[0]) rescue true
+
+# support short item form e.g. "cons 0"
+SHORTS = {
+  "rm" => "--rm",
+  "keep" => "--keep",
+  "next" => "--next",
+  "ls" => "--list"
+}
+
+if SHORTS.keys.member? ARGV[0]
+  ARGV[0] = SHORTS[ARGV[0]]
+end
+
+# defaults
+OPTIONS = {}
+
+OptionParser.new do |opts|
+  opts.on("--next [S]", "Consume new next item") do OPTIONS[:next] = true end
+  opts.on("--filter [S]", "Limit to filenames with string") do |v| OPTIONS[:filter] = v end
+  opts.on("--dir [dir]", "Store file in dir") do |v| OPTIONS[:dir] = v end
+  opts.on("--now", "Consume item now") do OPTIONS[:now] = true end
+  opts.on("--retry", "Retry failed downloads") do OPTIONS[:retry] = true end
+  opts.on("--delete", "Delete after consuming") do OPTIONS[:delete] = true end
+  opts.on("--url [URL]", "Download url") do |v| OPTIONS[:url] = v end
+  opts.on("--mv [FILE]", "Move file") do |v| OPTIONS[:move] = v end
+  opts.on("--cp [FILE]", "Copy file") do |v| OPTIONS[:copy] = v end
+  opts.on("--rm [ID]", "Remove file") do |v| OPTIONS[:remove] = v end
+  opts.on("--keep [ID]", "Keep file") do |v| OPTIONS[:keep] = v end
+  opts.on("--item [ID]", "Consume item") do |v| OPTIONS[:item] = v end
+  opts.on("--list", "List items") do OPTIONS[:list] = true end
+  opts.on("--delete-consumed", "Delete consumed") do
+    OPTIONS[:delete_consumed] = true end
+end.parse!
+
+def failure
+  ($?.to_i != 0)
+end
+
+def notify summary, message
+  `notify-send "#{summary}" "#{message}"`
+end
+
+def notify_download_result url, failed
+  if failed then
+    notify "download failed", url
+  else
+    notify "download successful", url
+  end
+end
+
+def retry_later url
+  File.open(RETRY_FILE, "a") {|f| f.write(url+"\n")}
+end
+
+def download_youtube url, dir
+  `cd #{dir}; #{YDL} --no-part -t "#{url}" 1>&2`
+end
+
+def download url, dir
+  # mkdir in case it doesn't yet exist
+  `mkdir #{dir}`
+  
+  puts "downloading #{url}"
+  # create temp download dir
+  hash = md5 url
+  dir += hash
+  `mkdir #{dir}`
+  
+  if url.include? "youtube.com"
+    download_youtube url, dir
+  else
+    `#{DOWNLOADER} #{dir} "#{url}"`
+  end
+  failed = failure
+  notify_download_result url, failed
+  # if failure, append url to retry file
+  if failed then
+    retry_later url
+  else
+    # move file from temp download dir to real one
+    filename=`find -L #{dir} -type f`.sub "\n", ""
+    newfilename=filename.sub hash+"/", ""
+    `mv #{filename} #{newfilename}`
+    `rmdir #{dir}`
+    newfilename
+  end
+end
+
+def filter_items items, filter
+  if filter
+    items.select {|item| item.include? filter}
+  else
+    items
+  end
+end
+
+def filter_list_items items
+  results = items.split("\n").reject{|i| i.end_with? ".part"}
+  filter_items results, OPTIONS[:filter]
+end
+  
+def list_items
+  filter_list_items `find -L #{DIR} -type f`
+end
+
+def list_items_brief items
+  files = list_items
+  files.each_index{|i| files[i] = files[i].sub!(/.*\/cons\/(.*)/, '\1')}
+  files.reject{|i| i.end_with? ".part"}
+  files.each{|s| s.sub!("/","\t")}
+end
+
+def display_items items
+  items.each_index do |index|
+    item = items[index]
+    consumed = if consumed? item then "*" else " " end
+    keep = if keep? item then "!" else " " end
+    clean_item = item.sub("_CONSUMED", "").sub("_KEEP", "")
+    puts "#{index.to_s.ljust 3} #{consumed}#{keep}\t#{clean_item}"
+  end
+end
+
+def mark_consumed path
+  unless consumed? path
+    File.rename path, path+"_CONSUMED"
+  end
+end
+
+def mark_keep path
+  unless keep? path
+    File.rename path, path+"_KEEP"
+  end
+end
+
+def item_has_extension item, extensions
+  extensions.any? {|ext| item.include? ext }
+end
+
+def player item
+  if item_has_extension item, [".mp4", ".mov", ".flv", ".mp3"]
+    "mplayer -msgcolor -af scaletempo -speed 1.8"
+  elsif item_has_extension item, [".pdf"]
+    "zathura"
+  else
+    "gnome-open"
+  end
+end
+
+def play_item path
+  cmd = player path
+  `#{cmd} #{path} 1>&2`
+  if failure then
+    puts "ERROR playing #{path} failed"
+  else
+    mark_consumed path
+  end
+end
+
+def remove_file file
+  `rm #{file}`
+end
+
+def move_file file, dir
+  `mv #{file} #{dir}`
+end
+
+def copy_file file, dir
+  `cp #{file} #{dir}`
+end
+
+def delete_consumed items
+  items.each {|path|
+    `rm "#{path}"`
+  }
+end
+
+def directory
+  (OPTIONS[:dir] or "misc") + "/"
+end
+
+def consumed? s
+  s.include? "_CONSUMED"
+end
+
+def keep? s
+  s.include? "_KEEP"
+end
+
+
+def new_items
+  list_items.select {|i| not consumed? i}
+end
+
+def play_new
+  next_item = new_items[0]
+  if next_item
+    play_item next_item
+  else
+    puts "No more new items"
+  end
+end
+
+def main
+
+  if OPTIONS[:url] then
+    last_download = download OPTIONS[:url], DIR+directory
+
+  elsif OPTIONS[:list] then
+    display_items list_items_brief list_items
+
+  elsif OPTIONS[:move] then
+    move_file OPTIONS[:move], DIR+directory
+
+  elsif OPTIONS[:copy] then
+    copy_file OPTIONS[:copy], DIR+directory
+
+  elsif OPTIONS[:next] then
+    play_new
+
+  elsif OPTIONS[:remove] then
+    remove_file list_items[OPTIONS[:remove].to_i]
+
+  elsif OPTIONS[:keep] then
+    mark_keep list_items[OPTIONS[:keep].to_i]
+  end
+
+  
+  if OPTIONS[:delete_consumed] then
+    delete_consumed list_items.select {|item| consumed?(item) && !keep?(item)}
+  end
+
+  if OPTIONS[:now] then
+    play_item last_download
+    remove_file last_download if OPTIONS[:delete]
+  end
+  
+  if OPTIONS[:item] then
+    item = list_items[OPTIONS[:item].to_i]
+    play_item item
+    remove_file item if OPTIONS[:delete]
+  end
+end
+
+main
